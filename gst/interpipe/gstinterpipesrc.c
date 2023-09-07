@@ -362,6 +362,11 @@ gst_inter_pipe_src_finalize (GObject * object)
 
   src = GST_INTER_PIPE_SRC (object);
 
+  if (src->listen_to) {
+    g_free (src->listen_to);
+    src->listen_to = NULL;
+  }
+
   /* Free pending serial events queue */
   g_queue_free_full (src->pending_serial_events,
       (GDestroyNotify) gst_event_unref);
@@ -417,10 +422,12 @@ gst_inter_pipe_src_stop (GstBaseSrc * base)
   GstBaseSrcClass *basesrc_class;
   GstInterPipeSrc *src;
   GstInterPipeIListener *listener;
+  GstAppSrc *appsrc;
 
   basesrc_class = GST_BASE_SRC_CLASS (gst_inter_pipe_src_parent_class);
   src = GST_INTER_PIPE_SRC (base);
   listener = GST_INTER_PIPE_ILISTENER (src);
+  appsrc = GST_APP_SRC (src);
 
   if (src->listening) {
     GST_INFO_OBJECT (src, "Removing listener from node %s", src->listen_to);
@@ -429,6 +436,9 @@ gst_inter_pipe_src_stop (GstBaseSrc * base)
     g_free (src->listen_to);
     src->listen_to = NULL;
   }
+
+  GST_INFO_OBJECT (src, "Cleaning appsrc caps");
+  gst_app_src_set_caps (appsrc, NULL);
 
   return basesrc_class->stop (base);
 }
@@ -484,13 +494,14 @@ gst_inter_pipe_src_create (GstBaseSrc * base, guint64 offset, guint size,
       "Dequeue buffer %p with timestamp (PTS) %" GST_TIME_FORMAT, *buf,
       GST_TIME_ARGS (GST_BUFFER_PTS (*buf)));
 
-  if (!g_queue_is_empty (src->pending_serial_events)) {
+  while (!g_queue_is_empty (src->pending_serial_events)) {
     guint curr_bytes;
     /*Pending Serial Events Queue */
     serial_event = g_queue_peek_head (src->pending_serial_events);
 
     GST_DEBUG_OBJECT (src,
-        "Got event with timestamp %" GST_TIME_FORMAT,
+        "Got event %s with timestamp %" GST_TIME_FORMAT,
+        GST_EVENT_TYPE_NAME (serial_event),
         GST_TIME_ARGS (GST_EVENT_TIMESTAMP (serial_event)));
 
     curr_bytes = gst_app_src_get_current_level_bytes (GST_APP_SRC (src));
@@ -506,6 +517,7 @@ gst_inter_pipe_src_create (GstBaseSrc * base, guint64 offset, guint size,
       GST_DEBUG_OBJECT (src, "Event %s timestamp is greater than the "
           "buffer timestamp, can't send serial event yet",
           GST_EVENT_TYPE_NAME (serial_event));
+          break;
     }
   }
 
@@ -685,15 +697,25 @@ gst_inter_pipe_src_push_buffer (GstInterPipeIListener * iface,
         "Calculated Buffer Timestamp (PTS): %" GST_TIME_FORMAT,
         GST_TIME_ARGS (GST_BUFFER_PTS (buffer)));
   } else if (GST_INTER_PIPE_SRC_RESTART_TIMESTAMP == src->stream_sync) {
-    parentbuffer = gst_buffer_ref (buffer);
-    buffer = gst_buffer_make_writable (buffer);
-    gst_buffer_add_parent_buffer_meta (buffer, parentbuffer);
-    gst_buffer_unref (parentbuffer);
+    if (GST_STATE (src) == GST_STATE_PLAYING) {
+      parentbuffer = gst_buffer_ref (buffer);
+      buffer = gst_buffer_make_writable (buffer);
+      gst_buffer_add_parent_buffer_meta (buffer, parentbuffer);
+      gst_buffer_unref (parentbuffer);
 
-    /* Remove the incoming timestamp to be generated according this basetime */
-    buffer = gst_buffer_make_writable (buffer);
-    GST_BUFFER_PTS (buffer) = GST_CLOCK_TIME_NONE;
-    GST_BUFFER_DTS (buffer) = GST_CLOCK_TIME_NONE;
+      /* Remove the incoming timestamp to be generated according this basetime */
+      buffer = gst_buffer_make_writable (buffer);
+      GST_BUFFER_PTS (buffer) = GST_CLOCK_TIME_NONE;
+      GST_BUFFER_DTS (buffer) = GST_CLOCK_TIME_NONE;
+    } else {
+      /*
+       * appsrc requires srcbasetime to re-timestamp buffers, and srcbasetime
+       * is only valid when PLAYING.
+       */
+      GST_LOG_OBJECT (src, "Not PLAYING state yet");
+      gst_buffer_unref (buffer);
+      goto nosync;
+    }
   }
 
   ret = gst_app_src_push_buffer (appsrc, buffer);
@@ -740,8 +762,13 @@ gst_inter_pipe_src_push_event (GstInterPipeIListener * iface, GstEvent * event,
     srcbasetime = gst_element_get_base_time (GST_ELEMENT (appsrc));
 
     if (srcbasetime > basetime) {
-      GST_EVENT_TIMESTAMP (event) =
-          GST_EVENT_TIMESTAMP (event) - (srcbasetime - basetime);
+      // GST_EVENT_TIMESTAMP (event) =
+      //     GST_EVENT_TIMESTAMP (event) - (srcbasetime - basetime);
+      if (GST_EVENT_TIMESTAMP (event) > (srcbasetime - basetime))
+        GST_EVENT_TIMESTAMP (event) =
+            GST_EVENT_TIMESTAMP (event) - (srcbasetime - basetime);
+      else
+        GST_EVENT_TIMESTAMP (event) = 0;
     } else {
       GST_EVENT_TIMESTAMP (event) =
           GST_EVENT_TIMESTAMP (event) + (basetime - srcbasetime);
@@ -760,6 +787,7 @@ no_events:
     GST_DEBUG_OBJECT (src,
         "The interpipesrc is not currently processing the incoming events "
         "because the accept incoming events property is set to FALSE");
+    gst_event_unref (event);
     return TRUE;
   }
 }
